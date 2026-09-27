@@ -13,6 +13,10 @@
 - 提供**只读修补覆盖核对**：指定风机、叶片、巡检与修补区域列表，对该巡检的**原始观察**
   逐条计算被修补区域**并集**覆盖的面积（径向米 × 钟位小时），重叠修补只计一次，
   输出未覆盖 / 部分覆盖 / 全覆盖状态及零面积观察单列；
+- 提供**叶片复核报告签发与核验**：在同一 SQLite 事务内读取当前观察与裁决、校验预期
+  裁决 `revision`、实时生成轨迹，将轨迹及来源、观察/裁决**两类输入指纹**与签发时间
+  固化为**不可变报告**；报告读取永远返回签发快照，核验接口只读重算指纹并指出
+  观察或裁决是否已变化；
 - 依赖安装、SQLite 建表与数据库初始化均随容器启动自动完成。
 
 ## 单条命令启动
@@ -96,6 +100,9 @@ docker compose up -d --build
 | GET | `/adjudications/{turbine_id}/{blade_id}` | 查询某叶片的全部裁决与当前 revision |
 | GET | `/inspection-changes/{turbine_id}/{blade_id}` | 只读巡检变化报告（两期轨迹持续/新增/消失对比） |
 | POST | `/repair-coverage` | 只读修补覆盖核对（修补区域并集对巡检原始观察面积的覆盖率） |
+| POST | `/review-reports` | 签发不可变叶片复核报告（同事务校验 revision、实时成轨并固化） |
+| GET | `/review-reports/{report_id}` | 读取报告签发快照（不可变，不受后续观察/裁决变化影响） |
+| GET | `/review-reports/{report_id}/verify` | 只读核验：重算两类指纹，指出观察/裁决变化及是否仍为当前版本 |
 
 ### 1. 写入观察批次
 
@@ -451,6 +458,105 @@ curl -s "http://localhost:8000/api/v1/inspection-changes/WT-A01/B2?before=drone-
 `summary` 汇总仅统计参与核对的正面积观察（`total_coverage_ratio =
 覆盖面积合计 / 原面积合计`，无正面积观察时为 `null`）；`results` 按观察 ID 排序。
 
+### 8. 叶片复核报告签发与核验
+
+复核报告是一份**签发即不可变**的快照：轨迹（含完整来源）、观察/裁决两类输入指纹、
+裁决 revision 与签发时间一次性固化。即使之后观察或裁决改变，`GET` 永远返回原样；
+`verify` 只读重算当前指纹并逐类比对。
+
+#### 8.1 签发报告
+
+`POST /api/v1/review-reports`
+
+在**同一 SQLite 事务**（`BEGIN IMMEDIATE`，读取-计算-写入整体串行化）内完成：
+读取当前观察与裁决 → 校验预期裁决 revision → 实时生成轨迹 → 固化报告行。
+
+```json
+{
+  "report_id": "rep-2026-09-27-01",
+  "turbine_id": "WT-A01",
+  "blade_id": "B2",
+  "expected_adjudication_revision": 0
+}
+```
+
+| 字段 | 类型/说明 |
+| --- | --- |
+| `report_id` | 可空，缺省服务端生成（`report_` + 随机十六进制） |
+| `expected_adjudication_revision` | 客户端预期的当前裁决 revision（无裁决传 `0`） |
+
+成功返回 `201 Created`，响应即签发快照：
+
+```json
+{
+  "report_id": "rep-2026-09-27-01",
+  "turbine_id": "WT-A01",
+  "blade_id": "B2",
+  "adjudication_revision": 0,
+  "fingerprints": {
+    "observation_fingerprint": "9f2c…（SHA-256，全部观察规范化内容）",
+    "ruling_fingerprint": "4b1e…（SHA-256，全部人工裁决规范化内容）"
+  },
+  "trajectory_count": 1,
+  "trajectories": [ { "...": "签发时刻实时生成的轨迹，结构同复核查询，sources 含完整来源" } ],
+  "issued_at": "2026-09-27T08:30:00+00:00"
+}
+```
+
+拒绝签发（事务回滚，**不留任何半成品**）：
+
+- 预期 revision 与当前不符 → `409`，沿用统一错误格式并回带版本号：
+
+```json
+{ "detail": "裁决 revision 不符：请求预期 0，当前生效 2",
+  "expected_revision": 0, "current_revision": 2 }
+```
+
+- 当前裁决集合自相矛盾（禁止同轨落入闭包）→ `409`，错误体与重算接口一致
+  （`cannot_link_adjudication_id` / `must_link_chain`）；
+- 叶片无观察 → `404`；`report_id` 已被占用 → `409`。
+
+#### 8.2 读取签发快照
+
+`GET /api/v1/review-reports/rep-2026-09-27-01`
+
+返回与签发响应完全一致的快照；报告**只追加、永不更新**，后续观察新增或裁决变化后
+读取结果保持原样。报告不存在 → `404`。
+
+#### 8.3 核验（只读）
+
+`GET /api/v1/review-reports/rep-2026-09-27-01/verify`
+
+重新计算该叶片**当前**两类输入指纹，分别指出变化并给出总体结论。核验全程只读，
+不修改报告或任何其他数据：
+
+```json
+{
+  "report_id": "rep-2026-09-27-01",
+  "turbine_id": "WT-A01",
+  "blade_id": "B2",
+  "current_adjudication_revision": 2,
+  "report_adjudication_revision": 0,
+  "observations_changed": true,
+  "rulings_changed": true,
+  "revision_current": false,
+  "is_current": false,
+  "report_fingerprints": {
+    "observation_fingerprint": "9f2c…（签发时）",
+    "ruling_fingerprint": "4b1e…（签发时）"
+  },
+  "current_fingerprints": {
+    "observation_fingerprint": "1a8d…（当前重算）",
+    "ruling_fingerprint": "77fa…（当前重算）"
+  }
+}
+```
+
+- `observations_changed` / `rulings_changed`：观察、裁决两类输入各自是否已变化；
+- `revision_current`：裁决 revision 是否仍为签发版本；
+- `is_current`：报告是否仍为当前版本——**两类指纹均未变化**时为 `true`；
+- 核验不执行成轨计算，即使当前裁决相互冲突也能正常返回指纹比对结果。
+
 ## curl 快速验证
 
 ```bash
@@ -488,6 +594,19 @@ curl -s -X POST http://localhost:8000/api/v1/repair-coverage \
   -d '{"turbine_id":"WT-A01","blade_id":"B2","inspection_id":"drone-0901","regions":[{"radius_start":2.0,"radius_end":6.0,"clock_start":11.0,"clock_end":1.0}]}'
 ```
 
+签发、读取与核验叶片复核报告（端口默认 `8000`）：
+
+```bash
+# 签发：携带当前裁决 revision（无裁决传 0），成功返回 201 与不可变快照
+curl -s -X POST http://localhost:8000/api/v1/review-reports \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id":"rep-demo-1","turbine_id":"WT-A01","blade_id":"B2","expected_adjudication_revision":0}'
+# 此后观察或裁决再变化，读取结果仍是签发原样
+curl -s http://localhost:8000/api/v1/review-reports/rep-demo-1
+# 只读核验：重算当前两类指纹，指出观察/裁决变化与是否仍为当前版本
+curl -s http://localhost:8000/api/v1/review-reports/rep-demo-1/verify
+```
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -509,13 +628,13 @@ python -m unittest discover -s tests -v
 ├── app/
 │   ├── main.py         # FastAPI 入口、路由、startup 建表
 │   ├── schemas.py      # Pydantic 请求/响应模型与字段校验
-│   ├── services.py     # 写入幂等、重算、查询、巡检变化报告业务逻辑
+│   ├── services.py     # 写入幂等、重算、查询、巡检变化、复核报告签发/核验业务逻辑
 │   ├── clustering.py   # 并查集聚类 + 轨迹合并
 │   ├── matching.py     # 跨期轨迹配对：重叠面积加权 + 全局最大权一对一匹配
 │   ├── coverage.py     # 只读修补覆盖核对：径向切片精确求修补区域并集覆盖面积
 │   ├── geometry.py     # 径向/钟位弧相交、重叠长度与合并（含跨 12 点）
-│   └── db.py           # SQLite 连接、schema 初始化、数据访问
-├── tests/              # 几何 / 聚类 / 匹配 / 覆盖核对 / 端到端 API 测试
+│   └── db.py           # SQLite 连接、schema 初始化、事务与数据访问
+├── tests/              # 几何 / 聚类 / 匹配 / 覆盖核对 / 裁决 / 复核报告 / 端到端 API 测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

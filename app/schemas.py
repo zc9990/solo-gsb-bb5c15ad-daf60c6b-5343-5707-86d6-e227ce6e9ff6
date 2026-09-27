@@ -303,6 +303,83 @@ class PersistingTrajectory(BaseModel):
     after: ChangeTrajectorySide
 
 
+class ReviewReportIssueRequest(BaseModel):
+    """叶片复核报告签发请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_id: Optional[str] = Field(
+        default=None, max_length=64,
+        description="报告编号；缺省时由服务端生成（report_ 前缀 + 随机十六进制）",
+    )
+    turbine_id: str = Field(..., max_length=64, description="风机编号")
+    blade_id: str = Field(..., max_length=64, description="叶片编号")
+    expected_adjudication_revision: int = Field(
+        ..., ge=0,
+        description="客户端预期该叶片当前生效的裁决 revision；与库中不符则拒绝签发",
+    )
+
+
+class ReviewReportFingerprints(BaseModel):
+    observation_fingerprint: str = Field(
+        ..., description="签发时刻全部观察的规范化内容指纹（SHA-256）",
+    )
+    ruling_fingerprint: str = Field(
+        ..., description="签发时刻全部人工关联裁决的规范化内容指纹（SHA-256）",
+    )
+
+
+class ReviewReportSnapshot(BaseModel):
+    """不可变复核报告签发快照：读取后即与后续观察/裁决变化无关。"""
+
+    report_id: str
+    turbine_id: str
+    blade_id: str
+    adjudication_revision: int = Field(
+        ..., description="签发时刻生效的裁决 revision",
+    )
+    fingerprints: ReviewReportFingerprints
+    trajectory_count: int
+    trajectories: List[TrajectoryOut] = Field(
+        default_factory=list,
+        description="签发时刻实时生成并固化的裂纹轨迹（含完整来源清单）",
+    )
+    issued_at: str = Field(..., description="报告签发时间（UTC ISO-8601）")
+
+
+class ReviewReportVerifyResponse(BaseModel):
+    """复核报告核验结果（只读：重算当前指纹，绝不修改报告或任何数据）。"""
+
+    report_id: str
+    turbine_id: str
+    blade_id: str
+    current_adjudication_revision: int = Field(
+        ..., description="核验时刻该叶片当前生效的裁决 revision",
+    )
+    report_adjudication_revision: int = Field(
+        ..., description="报告签发时固化的裁决 revision",
+    )
+    observations_changed: bool = Field(
+        ..., description="当前观察指纹是否与签发时不一致",
+    )
+    rulings_changed: bool = Field(
+        ..., description="当前裁决指纹是否与签发时不一致",
+    )
+    revision_current: bool = Field(
+        ..., description="裁决 revision 是否仍为签发时的版本",
+    )
+    is_current: bool = Field(
+        ...,
+        description="报告是否仍为当前版本：观察与裁决两类指纹均未变化时为 true",
+    )
+    report_fingerprints: ReviewReportFingerprints = Field(
+        ..., description="报告签发时固化的两类输入指纹",
+    )
+    current_fingerprints: ReviewReportFingerprints = Field(
+        ..., description="核验时刻重新计算的两类输入指纹",
+    )
+
+
 class InspectionChangeReport(BaseModel):
     """两期巡检的裂纹轨迹变化报告（只读，实时计算）。"""
 

@@ -22,6 +22,9 @@ from .schemas import (
     RecomputeResponse,
     RepairCoverageRequest,
     RepairCoverageResponse,
+    ReviewReportIssueRequest,
+    ReviewReportSnapshot,
+    ReviewReportVerifyResponse,
     ReviewResponse,
 )
 
@@ -32,6 +35,8 @@ app = FastAPI(
         "将径向与钟位范围相交的观察聚为连通簇，合并为带来源清单的裂纹轨迹，"
         "并标注等级冲突。支持观察写入、复核查询、按批次幂等重算，"
         "以及两期巡检间轨迹持续/新增/消失的只读变化报告。"
+        "支持签发不可变叶片复核报告：同一事务内校验裁决 revision 并实时成轨，"
+        "将轨迹与两类输入指纹固化，随后可只读核验观察/裁决是否已变化。"
     ),
     version="1.0.0",
 )
@@ -130,3 +135,34 @@ def get_inspection_changes(
 )
 def repair_coverage(payload: RepairCoverageRequest) -> dict:
     return services.repair_coverage(payload)
+
+
+@app.post(
+    "/api/v1/review-reports",
+    tags=["复核报告"],
+    response_model=ReviewReportSnapshot,
+    status_code=201,
+    summary="签发不可变叶片复核报告（同事务校验 revision、实时生成轨迹并固化快照）",
+)
+def issue_review_report(payload: ReviewReportIssueRequest) -> dict:
+    return services.issue_review_report(payload)
+
+
+@app.get(
+    "/api/v1/review-reports/{report_id}",
+    tags=["复核报告"],
+    response_model=ReviewReportSnapshot,
+    summary="读取复核报告签发快照（不可变，不受后续观察/裁决变化影响）",
+)
+def get_review_report(report_id: str) -> dict:
+    return services.get_review_report(report_id)
+
+
+@app.get(
+    "/api/v1/review-reports/{report_id}/verify",
+    tags=["复核报告"],
+    response_model=ReviewReportVerifyResponse,
+    summary="只读核验：重算两类输入指纹，指出观察/裁决变化与报告是否仍为当前版本",
+)
+def verify_review_report(report_id: str) -> dict:
+    return services.verify_review_report(report_id)

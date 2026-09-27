@@ -25,6 +25,7 @@ from .schemas import (
     BatchWriteRequest,
     ObservationIn,
     RepairCoverageRequest,
+    ReviewReportIssueRequest,
 )
 
 
@@ -670,3 +671,144 @@ def list_blade_adjudications(turbine_id: str, blade_id: str) -> Dict[str, Any]:
             "count": len(rows),
             "adjudications": [_row_to_adjudication(r, revision) for r in rows],
         }
+
+
+# --------------------------------------------------------- review reports
+
+def _report_snapshot(row: sqlite3.Row) -> Dict[str, Any]:
+    """把落库的不可变报告行还原为签发快照（响应结构）。"""
+    trajectories = json.loads(row["trajectories_json"])
+    return {
+        "report_id": row["report_id"],
+        "turbine_id": row["turbine_id"],
+        "blade_id": row["blade_id"],
+        "adjudication_revision": row["adjudication_revision"],
+        "fingerprints": {
+            "observation_fingerprint": row["observation_fingerprint"],
+            "ruling_fingerprint": row["ruling_fingerprint"],
+        },
+        "trajectory_count": row["trajectory_count"],
+        "trajectories": trajectories,
+        "issued_at": row["issued_at"],
+    }
+
+
+def issue_review_report(req: ReviewReportIssueRequest) -> Dict[str, Any]:
+    """签发叶片复核报告。
+
+    在**同一 SQLite 事务**（BEGIN IMMEDIATE，读取-计算-写入整体串行化）内：
+
+    1. 读取当前观察与裁决，校验预期裁决 revision；
+    2. 实时生成轨迹（禁止同轨冲突时抛 409，事务回滚）；
+    3. 把轨迹及来源、两类输入指纹、签发时间固化为**不可变**报告行。
+
+    版本不符（409）、裁决冲突（409）、叶片无观察（404）或报告编号冲突
+    （409）时拒绝签发，且**不留下任何半成品**（异常即回滚）。
+    """
+    report_id = req.report_id or f"report_{uuid.uuid4().hex[:16]}"
+    issued_at = utcnow()
+    with db.get_conn() as conn:
+        with db.transaction(conn, immediate=True):
+            count = db.blade_observation_count(
+                conn, req.turbine_id, req.blade_id)
+            if count == 0:
+                raise ApiError(
+                    404,
+                    f"叶片无观察记录: turbine={req.turbine_id} "
+                    f"blade={req.blade_id}",
+                )
+
+            current_revision = db.get_adjudication_revision(
+                conn, req.turbine_id, req.blade_id)
+            if current_revision != req.expected_adjudication_revision:
+                raise ApiError(
+                    409,
+                    f"裁决 revision 不符：请求预期 "
+                    f"{req.expected_adjudication_revision}，"
+                    f"当前生效 {current_revision}",
+                    extra={
+                        "expected_revision":
+                            req.expected_adjudication_revision,
+                        "current_revision": current_revision,
+                    },
+                )
+
+            obs_hash, _ = blade_input_hash(conn, req.turbine_id, req.blade_id)
+            ruling_hash = _rulings_fingerprint(conn, req.turbine_id,
+                                               req.blade_id)
+            # 禁止同轨冲突在此抛 409；异常使事务回滚，不落任何半成品
+            trajectories = _compute_live(conn, req.turbine_id, req.blade_id)
+
+            report = {
+                "report_id": report_id,
+                "turbine_id": req.turbine_id,
+                "blade_id": req.blade_id,
+                "adjudication_revision": current_revision,
+                "observation_fingerprint": obs_hash,
+                "ruling_fingerprint": ruling_hash,
+                "trajectory_count": len(trajectories),
+                "trajectories_json": _canonical_json(trajectories),
+                "issued_at": issued_at,
+            }
+            try:
+                db.insert_review_report(conn, report)
+            except sqlite3.IntegrityError as exc:
+                raise ApiError(
+                    409, f"report_id 已存在: {report_id}") from exc
+
+        row = db.get_review_report(conn, report_id)
+        assert row is not None
+        return _report_snapshot(row)
+
+
+def get_review_report(report_id: str) -> Dict[str, Any]:
+    """读取签发快照：报告不可变，后续观察/裁决变化不影响返回内容。"""
+    with db.get_conn() as conn:
+        row = db.get_review_report(conn, report_id)
+        if row is None:
+            raise ApiError(404, f"复核报告不存在: {report_id}")
+        return _report_snapshot(row)
+
+
+def verify_review_report(report_id: str) -> Dict[str, Any]:
+    """核验复核报告（只读）。
+
+    重新计算当前观察与裁决两类指纹，分别指出观察或裁决是否已变化，
+    以及报告是否仍为当前版本（两类指纹均未变化）。核验只读：
+    不做任何写操作，也不修改报告本身。
+    """
+    with db.get_conn() as conn:
+        with db.transaction(conn):
+            row = db.get_review_report(conn, report_id)
+            if row is None:
+                raise ApiError(404, f"复核报告不存在: {report_id}")
+
+            obs_hash, _ = blade_input_hash(conn, row["turbine_id"],
+                                           row["blade_id"])
+            ruling_hash = _rulings_fingerprint(conn, row["turbine_id"],
+                                               row["blade_id"])
+            current_revision = db.get_adjudication_revision(
+                conn, row["turbine_id"], row["blade_id"])
+
+    observations_changed = obs_hash != row["observation_fingerprint"]
+    rulings_changed = ruling_hash != row["ruling_fingerprint"]
+    return {
+        "report_id": row["report_id"],
+        "turbine_id": row["turbine_id"],
+        "blade_id": row["blade_id"],
+        "current_adjudication_revision": current_revision,
+        "report_adjudication_revision": row["adjudication_revision"],
+        "observations_changed": observations_changed,
+        "rulings_changed": rulings_changed,
+        "revision_current":
+            current_revision == row["adjudication_revision"],
+        "is_current": not observations_changed and not rulings_changed,
+        "report_fingerprints": {
+            "observation_fingerprint": row["observation_fingerprint"],
+            "ruling_fingerprint": row["ruling_fingerprint"],
+        },
+        "current_fingerprints": {
+            "observation_fingerprint": obs_hash,
+            "ruling_fingerprint": ruling_hash,
+        },
+    }

@@ -9,7 +9,7 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 DB_PATH = os.environ.get("CRACK_DB_PATH", "data/crack_review.db")
 
@@ -92,6 +92,23 @@ SCHEMA: Sequence[str] = (
         PRIMARY KEY (turbine_id, blade_id)
     )
     """,
+    # 叶片复核报告：只追加、永不更新/删除的不可变签发快照。
+    # 两类输入指纹分别固化观察集合与裁决集合，核验时重算并逐一比对。
+    """
+    CREATE TABLE IF NOT EXISTS review_reports (
+        report_id   TEXT PRIMARY KEY,
+        turbine_id  TEXT NOT NULL,
+        blade_id    TEXT NOT NULL,
+        adjudication_revision INTEGER NOT NULL,
+        observation_fingerprint TEXT NOT NULL,
+        ruling_fingerprint      TEXT NOT NULL,
+        trajectory_count INTEGER NOT NULL,
+        trajectories_json TEXT NOT NULL,
+        issued_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_report_blade"
+    " ON review_reports(turbine_id, blade_id)",
 )
 
 # 旧库平滑升级：review_state 增补裁决生效版本列
@@ -145,6 +162,32 @@ def get_conn() -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection,
+                immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """显式事务边界。
+
+    Python 的 sqlite3 默认隐式开启延迟事务，``BEGIN`` 在首次写操作时才发出；
+    “先读后写”的临界区（如复核报告签发）需要在读之前就持锁，否则并发写入
+    可能落在同一读快照与写锁之间。``immediate=True`` 显式发出
+    ``BEGIN IMMEDIATE`` 以写事务开始，将整个读取-计算-写入序列串行化。
+
+    正常退出提交；异常退出回滚——调用方只需把业务异常抛出即可，
+    不会留下任何半成品。
+    """
+    if immediate:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute("BEGIN")
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
 
 
 # ---------------------------------------------------------------- batches
@@ -363,3 +406,29 @@ def bump_adjudication_revision(conn: sqlite3.Connection, turbine_id: str,
         " WHERE turbine_id = ? AND blade_id = ?",
         (turbine_id, blade_id),
     ).fetchone()["revision"])
+
+
+# --------------------------------------------------------- review reports
+
+def insert_review_report(conn: sqlite3.Connection,
+                         report: Dict[str, Any]) -> None:
+    """追加一条不可变复核报告快照（仅 INSERT；表上不提供更新/删除）。"""
+    conn.execute(
+        """
+        INSERT INTO review_reports(
+            report_id, turbine_id, blade_id, adjudication_revision,
+            observation_fingerprint, ruling_fingerprint,
+            trajectory_count, trajectories_json, issued_at)
+        VALUES (:report_id, :turbine_id, :blade_id, :adjudication_revision,
+                :observation_fingerprint, :ruling_fingerprint,
+                :trajectory_count, :trajectories_json, :issued_at)
+        """,
+        report,
+    )
+
+
+def get_review_report(conn: sqlite3.Connection,
+                      report_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM review_reports WHERE report_id = ?", (report_id,)
+    ).fetchone()
