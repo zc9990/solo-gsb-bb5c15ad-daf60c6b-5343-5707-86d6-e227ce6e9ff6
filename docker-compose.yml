@@ -1,0 +1,22 @@
+services:
+  crack-review-api:
+    build: .
+    image: crack-review-api:1.0.0
+    container_name: crack-review-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      # SQLite 数据库文件路径（容器内）；依赖安装与建表均随容器启动完成
+      CRACK_DB_PATH: /data/crack_review.db
+    volumes:
+      - crack-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  crack-data:
