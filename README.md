@@ -13,6 +13,10 @@
 - 提供**只读修补覆盖核对**：指定风机、叶片、巡检与修补区域列表，对该巡检的**原始观察**
   逐条计算被修补区域**并集**覆盖的面积（径向米 × 钟位小时），重叠修补只计一次，
   输出未覆盖 / 部分覆盖 / 全覆盖状态及零面积观察单列；
+- 支持**复核报告签发与核验**：携带预期裁决 `revision` 为叶片签发**不可变**报告——
+  同一 SQLite 事务内读取当前观察与裁决、实时生成轨迹，并固化轨迹及来源、
+  **两类输入指纹**（观察 / 裁决）与签发时间；版本不符或裁决冲突时拒绝签发且**不留半成品**；
+  已签发快照不随后续数据变化而改变，可随时只读核验报告是否仍为当前版本；
 - 依赖安装、SQLite 建表与数据库初始化均随容器启动自动完成。
 
 ## 单条命令启动
@@ -96,6 +100,9 @@ docker compose up -d --build
 | GET | `/adjudications/{turbine_id}/{blade_id}` | 查询某叶片的全部裁决与当前 revision |
 | GET | `/inspection-changes/{turbine_id}/{blade_id}` | 只读巡检变化报告（两期轨迹持续/新增/消失对比） |
 | POST | `/repair-coverage` | 只读修补覆盖核对（修补区域并集对巡检原始观察面积的覆盖率） |
+| POST | `/review-reports` | 签发叶片复核报告（同一事务固化不可变快照，乐观锁，幂等） |
+| GET | `/review-reports/{report_id}` | 查询已签发的复核报告快照（不可变） |
+| GET | `/review-reports/{report_id}/verify` | 只读核验报告是否仍为当前版本（分别比对两类指纹） |
 
 ### 1. 写入观察批次
 
@@ -451,6 +458,99 @@ curl -s "http://localhost:8000/api/v1/inspection-changes/WT-A01/B2?before=drone-
 `summary` 汇总仅统计参与核对的正面积观察（`total_coverage_ratio =
 覆盖面积合计 / 原面积合计`，无正面积观察时为 `null`）；`results` 按观察 ID 排序。
 
+### 8. 签发复核报告
+
+`POST /api/v1/review-reports`
+
+为风机叶片的当前复核结果签发一份**不可变报告**：在**同一 SQLite 事务**
+（`BEGIN IMMEDIATE`）中读取该叶片当前全部观察与裁决、实时生成轨迹，并把
+**轨迹及来源清单、两类输入指纹、签发时间**整体固化。报告只增不改，
+不随后续观察或裁决的变化而变化。
+
+```json
+{
+  "report_id": "rr-2026-09-27-01",
+  "turbine_id": "WT-A01",
+  "blade_id": "B2",
+  "expected_adjudication_revision": 0
+}
+```
+
+| 字段 | 类型/说明 |
+| --- | --- |
+| `report_id` | 可空，缺省服务端生成（`rr_` 前缀）；相同 `report_id` + 相同请求（同叶片 + 同预期 revision）重复提交为幂等重放 |
+| `expected_adjudication_revision` | 客户端已知的叶片裁决版本（乐观锁），无裁决时传 `0` |
+
+成功响应（即报告快照，`GET` 返回同一结构）：
+
+```json
+{
+  "report_id": "rr-2026-09-27-01",
+  "turbine_id": "WT-A01",
+  "blade_id": "B2",
+  "adjudication_revision": 0,
+  "observation_fingerprint": "9f86d081884c7d659a2feaa0c55ad015...",
+  "adjudication_fingerprint": "d04e929b8f6a7b6d5c4b3a291807f6e5...",
+  "observation_count": 2,
+  "trajectory_count": 1,
+  "issued_at": "2026-09-27T08:00:00+00:00",
+  "trajectories": [ { "...": "签发时刻实时生成的轨迹及完整来源清单，结构同查询接口" } ]
+}
+```
+
+- 两类输入指纹：`observation_fingerprint` 为当前全部观察的规范化哈希；
+  `adjudication_fingerprint` 为**生效 revision + 裁决集合**的规范化哈希；
+- 叶片无观察 → `404`；`expected_adjudication_revision` 与当前生效版本不符 →
+  `409`，响应回带当前 `adjudication_revision`：
+
+```json
+{ "detail": "裁决 revision 不符：请求携带 0，当前生效 1", "adjudication_revision": 1 }
+```
+
+- 实时成轨若触发**禁止同轨冲突** → `409`，响应给出
+  `cannot_link_adjudication_id` 与 `must_link_chain`（格式同重算接口）；
+- 版本不符、裁决冲突或任何校验失败时事务整体回滚，**不留下半成品报告**
+  （以该 `report_id` 查询仍为 `404`）；
+- 相同 `report_id` 但叶片或预期 revision 与已签发报告不同 → `409`。
+
+### 9. 查询复核报告快照
+
+`GET /api/v1/review-reports/{report_id}`
+
+返回签发时固化的报告快照（轨迹、来源、指纹、签发时间）。即使签发后该叶片
+新增了观察或裁决，本接口返回内容仍与签发响应**逐字节一致**；报告不存在 → `404`。
+
+### 10. 核验复核报告（只读）
+
+`GET /api/v1/review-reports/{report_id}/verify`
+
+重新计算该叶片**当前**的两类输入指纹，与报告快照分别比对，指出观察或裁决
+是否已变化、报告是否仍为当前版本。接口**只读、实时计算**，不修改观察、
+裁决、复核结果或报告本身：
+
+```json
+{
+  "report_id": "rr-2026-09-27-01",
+  "turbine_id": "WT-A01",
+  "blade_id": "B2",
+  "observation_changed": true,
+  "adjudication_changed": false,
+  "is_current": false,
+  "report_observation_fingerprint": "9f86d081...",
+  "current_observation_fingerprint": "e3b0c442...",
+  "report_adjudication_fingerprint": "d04e929b...",
+  "current_adjudication_fingerprint": "d04e929b...",
+  "report_adjudication_revision": 0,
+  "current_adjudication_revision": 0,
+  "verified_at": "2026-09-27T09:30:00+00:00"
+}
+```
+
+- `observation_changed`：当前观察指纹与报告不一致（新增/变更过观察）；
+- `adjudication_changed`：当前裁决指纹（含 revision）与报告不一致；
+- `is_current`：两类指纹均与报告一致时为 `true`，即报告仍为当前版本；
+- 报告不存在 → `404`。
+
 ## curl 快速验证
 
 ```bash
@@ -488,6 +588,16 @@ curl -s -X POST http://localhost:8000/api/v1/repair-coverage \
   -d '{"turbine_id":"WT-A01","blade_id":"B2","inspection_id":"drone-0901","regions":[{"radius_start":2.0,"radius_end":6.0,"clock_start":11.0,"clock_end":1.0}]}'
 ```
 
+签发不可变复核报告（携带预期裁决 revision，无裁决传 `0`），随后查询快照并只读核验：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/review-reports \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id":"rr-demo-1","turbine_id":"WT-A01","blade_id":"B2","expected_adjudication_revision":0}'
+curl -s http://localhost:8000/api/v1/review-reports/rr-demo-1
+curl -s http://localhost:8000/api/v1/review-reports/rr-demo-1/verify
+```
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -509,13 +619,13 @@ python -m unittest discover -s tests -v
 ├── app/
 │   ├── main.py         # FastAPI 入口、路由、startup 建表
 │   ├── schemas.py      # Pydantic 请求/响应模型与字段校验
-│   ├── services.py     # 写入幂等、重算、查询、巡检变化报告业务逻辑
+│   ├── services.py     # 写入幂等、重算、查询、巡检变化报告、复核报告签发与核验业务逻辑
 │   ├── clustering.py   # 并查集聚类 + 轨迹合并
 │   ├── matching.py     # 跨期轨迹配对：重叠面积加权 + 全局最大权一对一匹配
 │   ├── coverage.py     # 只读修补覆盖核对：径向切片精确求修补区域并集覆盖面积
 │   ├── geometry.py     # 径向/钟位弧相交、重叠长度与合并（含跨 12 点）
 │   └── db.py           # SQLite 连接、schema 初始化、数据访问
-├── tests/              # 几何 / 聚类 / 匹配 / 覆盖核对 / 端到端 API 测试
+├── tests/              # 几何 / 聚类 / 匹配 / 覆盖核对 / 复核报告 / 端到端 API 测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

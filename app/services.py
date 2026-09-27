@@ -25,6 +25,7 @@ from .schemas import (
     BatchWriteRequest,
     ObservationIn,
     RepairCoverageRequest,
+    ReviewReportIssueRequest,
 )
 
 
@@ -669,4 +670,154 @@ def list_blade_adjudications(turbine_id: str, blade_id: str) -> Dict[str, Any]:
             "revision": revision,
             "count": len(rows),
             "adjudications": [_row_to_adjudication(r, revision) for r in rows],
+        }
+
+
+# ------------------------------------------------------------ review reports
+
+def _adjudication_state_fingerprint(conn: sqlite3.Connection,
+                                    turbine_id: str, blade_id: str
+                                    ) -> Tuple[str, int]:
+    """裁决输入指纹（生效 revision + 裁决集合）与当前 revision。"""
+    revision = db.get_adjudication_revision(conn, turbine_id, blade_id)
+    digest = hashlib.sha256(
+        f"{revision}|{_rulings_fingerprint(conn, turbine_id, blade_id)}"
+        .encode("utf-8")
+    ).hexdigest()
+    return digest, revision
+
+
+def _report_row_to_out(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "report_id": row["report_id"],
+        "turbine_id": row["turbine_id"],
+        "blade_id": row["blade_id"],
+        "adjudication_revision": row["adjudication_revision"],
+        "observation_fingerprint": row["observation_fingerprint"],
+        "adjudication_fingerprint": row["adjudication_fingerprint"],
+        "observation_count": row["observation_count"],
+        "trajectory_count": row["trajectory_count"],
+        "issued_at": row["issued_at"],
+        "trajectories": json.loads(row["data_json"]),
+    }
+
+
+def issue_review_report(req: ReviewReportIssueRequest) -> Dict[str, Any]:
+    """签发叶片复核报告（不可变快照）。
+
+    - 在同一 SQLite 事务（BEGIN IMMEDIATE）中读取当前观察与裁决、
+      实时生成轨迹，并将轨迹及来源、两类输入指纹、签发时间固化为报告；
+      任一步失败整体回滚，不留半成品；
+    - ``expected_adjudication_revision`` 为乐观锁：与当前生效 revision
+      不符返回 409 并回带当前值；
+    - 实时生成若触发禁止同轨冲突，返回 409 与冲突裁决链；
+    - 相同 report_id + 相同请求（同叶片 + 同预期 revision）重放为幂等，
+      返回已签发报告；report_id 相同但请求不同返回 409。
+    """
+    with db.get_conn() as conn:
+        try:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+
+                if req.report_id is not None:
+                    existing = db.get_review_report(conn, req.report_id)
+                    if existing is not None:
+                        if existing["turbine_id"] == req.turbine_id and \
+                                existing["blade_id"] == req.blade_id and \
+                                existing["adjudication_revision"] == \
+                                req.expected_adjudication_revision:
+                            return _report_row_to_out(existing)
+                        raise ApiError(
+                            409,
+                            f"report_id={req.report_id} 已存在"
+                            f"且与本次请求不一致",
+                        )
+
+                count = db.blade_observation_count(
+                    conn, req.turbine_id, req.blade_id)
+                if count == 0:
+                    raise ApiError(
+                        404,
+                        f"叶片无观察记录: turbine={req.turbine_id} "
+                        f"blade={req.blade_id}",
+                    )
+
+                adj_fp, revision = _adjudication_state_fingerprint(
+                    conn, req.turbine_id, req.blade_id)
+                if revision != req.expected_adjudication_revision:
+                    raise ApiError(
+                        409,
+                        f"裁决 revision 不符：请求携带 "
+                        f"{req.expected_adjudication_revision}，"
+                        f"当前生效 {revision}",
+                        extra={"adjudication_revision": revision},
+                    )
+
+                # 实时生成轨迹；禁止同轨冲突在此抛 409，事务回滚不留半成品
+                trajectories = _compute_live(conn, req.turbine_id, req.blade_id)
+                obs_fp, _ = blade_input_hash(conn, req.turbine_id, req.blade_id)
+
+                report_id = req.report_id or f"rr_{uuid.uuid4().hex[:16]}"
+                db.insert_review_report(conn, {
+                    "report_id": report_id,
+                    "turbine_id": req.turbine_id,
+                    "blade_id": req.blade_id,
+                    "adjudication_revision": revision,
+                    "observation_fingerprint": obs_fp,
+                    "adjudication_fingerprint": adj_fp,
+                    "observation_count": count,
+                    "trajectory_count": len(trajectories),
+                    "data_json": _canonical_json(trajectories),
+                    "issued_at": utcnow(),
+                })
+        except sqlite3.IntegrityError as exc:
+            raise ApiError(409,
+                           f"报告签发冲突（可能为并发重复提交）: {exc}") from exc
+
+        row = db.get_review_report(conn, report_id)
+        assert row is not None
+        return _report_row_to_out(row)
+
+
+def get_review_report(report_id: str) -> Dict[str, Any]:
+    """查询已签发的复核报告快照；后续观察/裁决变化不影响已固化内容。"""
+    with db.get_conn() as conn:
+        row = db.get_review_report(conn, report_id)
+        if row is None:
+            raise ApiError(404, f"复核报告不存在: report_id={report_id}")
+        return _report_row_to_out(row)
+
+
+def verify_review_report(report_id: str) -> Dict[str, Any]:
+    """只读核验复核报告。
+
+    重新计算该叶片当前两类输入指纹，与报告快照分别比对，指出观察或
+    裁决是否已变化、报告是否仍为当前版本；全程只读，不修改任何数据。
+    """
+    with db.get_conn() as conn:
+        row = db.get_review_report(conn, report_id)
+        if row is None:
+            raise ApiError(404, f"复核报告不存在: report_id={report_id}")
+        turbine_id, blade_id = row["turbine_id"], row["blade_id"]
+
+        obs_fp, _ = blade_input_hash(conn, turbine_id, blade_id)
+        adj_fp, revision = _adjudication_state_fingerprint(
+            conn, turbine_id, blade_id)
+        observation_changed = obs_fp != row["observation_fingerprint"]
+        adjudication_changed = adj_fp != row["adjudication_fingerprint"]
+
+        return {
+            "report_id": row["report_id"],
+            "turbine_id": turbine_id,
+            "blade_id": blade_id,
+            "observation_changed": observation_changed,
+            "adjudication_changed": adjudication_changed,
+            "is_current": not (observation_changed or adjudication_changed),
+            "report_observation_fingerprint": row["observation_fingerprint"],
+            "current_observation_fingerprint": obs_fp,
+            "report_adjudication_fingerprint": row["adjudication_fingerprint"],
+            "current_adjudication_fingerprint": adj_fp,
+            "report_adjudication_revision": row["adjudication_revision"],
+            "current_adjudication_revision": revision,
+            "verified_at": utcnow(),
         }

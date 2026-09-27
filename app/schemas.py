@@ -303,6 +303,70 @@ class PersistingTrajectory(BaseModel):
     after: ChangeTrajectorySide
 
 
+class ReviewReportIssueRequest(BaseModel):
+    """复核报告签发请求（按叶片，乐观锁）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_id: Optional[str] = Field(
+        default=None, max_length=64,
+        description="报告编号；缺省服务端生成。相同 report_id + 相同请求"
+                    "（同叶片 + 同预期 revision）重复提交为幂等重放",
+    )
+    turbine_id: str = Field(..., max_length=64, description="风机编号")
+    blade_id: str = Field(..., max_length=64, description="叶片编号")
+    expected_adjudication_revision: int = Field(
+        ..., ge=0,
+        description="客户端已知的该叶片裁决 revision（乐观锁）；无裁决时传 0",
+    )
+
+
+class ReviewReportOut(BaseModel):
+    """已签发的复核报告快照（不可变：后续观察/裁决变化不影响本快照）。"""
+
+    report_id: str
+    turbine_id: str
+    blade_id: str
+    adjudication_revision: int = Field(..., description="签发时生效的裁决 revision")
+    observation_fingerprint: str = Field(
+        ..., description="签发时观察输入指纹（sha256）",
+    )
+    adjudication_fingerprint: str = Field(
+        ..., description="签发时裁决输入指纹（生效 revision + 裁决集合，sha256）",
+    )
+    observation_count: int
+    trajectory_count: int
+    issued_at: str = Field(..., description="签发时间 ISO-8601（UTC）")
+    trajectories: List[TrajectoryOut] = Field(
+        default_factory=list,
+        description="签发时刻实时生成并固化的轨迹及来源清单",
+    )
+
+
+class ReviewReportVerifyResponse(BaseModel):
+    """复核报告核验结果（只读，不修改任何数据）。"""
+
+    report_id: str
+    turbine_id: str
+    blade_id: str
+    observation_changed: bool = Field(
+        ..., description="当前观察输入指纹与报告不一致",
+    )
+    adjudication_changed: bool = Field(
+        ..., description="当前裁决输入指纹与报告不一致",
+    )
+    is_current: bool = Field(
+        ..., description="两类指纹均与报告一致，报告仍为当前版本",
+    )
+    report_observation_fingerprint: str
+    current_observation_fingerprint: str
+    report_adjudication_fingerprint: str
+    current_adjudication_fingerprint: str
+    report_adjudication_revision: int
+    current_adjudication_revision: int
+    verified_at: str = Field(..., description="核验时间 ISO-8601（UTC）")
+
+
 class InspectionChangeReport(BaseModel):
     """两期巡检的裂纹轨迹变化报告（只读，实时计算）。"""
 

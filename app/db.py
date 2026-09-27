@@ -92,6 +92,24 @@ SCHEMA: Sequence[str] = (
         PRIMARY KEY (turbine_id, blade_id)
     )
     """,
+    # 复核报告：签发即不可变的轨迹快照（只 INSERT，无更新/删除）。
+    # data_json 固化签发时刻实时生成的轨迹及来源清单；
+    # 两类输入指纹（观察 / 裁决）供事后核验报告是否仍为当前版本。
+    """
+    CREATE TABLE IF NOT EXISTS review_reports (
+        report_id TEXT PRIMARY KEY,
+        turbine_id TEXT NOT NULL,
+        blade_id   TEXT NOT NULL,
+        adjudication_revision INTEGER NOT NULL,
+        observation_fingerprint TEXT NOT NULL,
+        adjudication_fingerprint TEXT NOT NULL,
+        observation_count INTEGER NOT NULL,
+        trajectory_count INTEGER NOT NULL,
+        data_json  TEXT NOT NULL,
+        issued_at  TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_reports_blade ON review_reports(turbine_id, blade_id)",
 )
 
 # 旧库平滑升级：review_state 增补裁决生效版本列
@@ -363,3 +381,32 @@ def bump_adjudication_revision(conn: sqlite3.Connection, turbine_id: str,
         " WHERE turbine_id = ? AND blade_id = ?",
         (turbine_id, blade_id),
     ).fetchone()["revision"])
+
+
+# --------------------------------------------------------- review reports
+
+def get_review_report(conn: sqlite3.Connection,
+                      report_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM review_reports WHERE report_id = ?", (report_id,)
+    ).fetchone()
+
+
+def insert_review_report(conn: sqlite3.Connection,
+                         report: Dict[str, Any]) -> None:
+    """写入一份复核报告。报告不可变：全库仅此处 INSERT，无更新/删除路径。"""
+    conn.execute(
+        """
+        INSERT INTO review_reports(report_id, turbine_id, blade_id,
+                                   adjudication_revision,
+                                   observation_fingerprint,
+                                   adjudication_fingerprint,
+                                   observation_count, trajectory_count,
+                                   data_json, issued_at)
+        VALUES (:report_id, :turbine_id, :blade_id, :adjudication_revision,
+                :observation_fingerprint, :adjudication_fingerprint,
+                :observation_count, :trajectory_count,
+                :data_json, :issued_at)
+        """,
+        report,
+    )
